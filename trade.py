@@ -79,6 +79,31 @@ MAX_POSITION   = 20000   # hard exchange limit (gross/net)
 # -- EMA --
 EMA_ALPHA      = 0.03    # ~23-tick half-life at 1 tick/sec
 
+# -- Timing / blackout --
+MIN_TICK       = 10      # don't trade before this tick (let market stabilize)
+BLACKOUT_PRE   = 5       # ticks before a news event to pull orders
+BLACKOUT_POST  = 5       # ticks after a news event to stay dark
+
+# News event ticks where the price can gap (from docs/rit_api.md timeline).
+# Personal harvests change our position; aggregate reveals total supply.
+_NEWS_TICKS = [
+    50,   # personal H1 warning  ("released in 10sec")
+    60,   # personal H1 drop     (qty auto-credited to BNZ)
+    170,  # aggregate H1 warning ("Release in 10sec")
+    180,  # aggregate H1 release ("Total Harvest is N")
+    289,  # personal H2 warning
+    299,  # personal H2 drop
+]
+
+
+def _in_blackout(tick: int) -> bool:
+    """True if we should NOT have orders resting during this tick."""
+    if tick <= MIN_TICK:
+        return True
+    return any(t - BLACKOUT_PRE <= tick <= t + BLACKOUT_POST
+               for t in _NEWS_TICKS)
+
+
 # -- Extreme fat-finger rungs (always on, outside the ladder) --
 EXTREME_BID_PRICE = 0.00
 EXTREME_BID_QTY   = 1000
@@ -313,6 +338,7 @@ class MarketMaker:
 
         Volume scales with inventory: the side we want to shed gets bigger,
         the side we'd accumulate on shrinks, linearly in inv_ratio.
+        Includes extreme fat-finger rungs.
         """
         inv_ratio = max(-1.0, min(1.0, (post_x - TARGET) / MAX_INVENTORY))
 
@@ -341,7 +367,104 @@ class MarketMaker:
             step = max(STEP_FLOOR, half_spread * STEP_FRAC) + lot * VOL_STEP_SCALE
             offset += step
 
+        # Extreme fat-finger rungs (respect hard position limit only)
+        if post_x < MAX_POSITION:
+            bids.append((EXTREME_BID_PRICE, EXTREME_BID_QTY))
+        if post_x > -MAX_POSITION:
+            asks.append((EXTREME_ASK_PRICE, EXTREME_ASK_QTY))
+
         return bids, asks
+
+    def _sync_ladder(
+        self,
+        desired_bids: List[Tuple[float, int]],
+        desired_asks: List[Tuple[float, int]],
+    ) -> Tuple[int, int, int, List[str]]:
+        """Differential order sync — only cancel/place what actually changed.
+
+        Matches existing resting orders against the desired ladder by
+        (action, price).  Orders at a matching price are KEPT (preserving
+        queue priority).  Unmatched existing orders are cancelled; unmatched
+        desired rungs are placed fresh.
+
+        If the diff is large enough to risk the 20-orders/sec rate limit,
+        falls back to bulk cancel + repost.
+
+        Returns (cancelled, placed, kept, errors).
+        """
+        # Build desired keyed by (action, price)
+        desired: dict[Tuple[str, float], int] = {}
+        for price, qty in desired_bids:
+            desired[("BUY", round(price, 2))] = qty
+        for price, qty in desired_asks:
+            desired[("SELL", round(price, 2))] = qty
+
+        # Ground truth: what's actually resting on the exchange
+        try:
+            open_orders = api_get("/orders?status=OPEN") or []
+        except Exception:
+            open_orders = []
+
+        # Match existing orders against desired rungs
+        matched: set[Tuple[str, float]] = set()
+        to_cancel: List[int] = []
+
+        for o in open_orders:
+            if o.get("ticker") != TICKER or o.get("type") != "LIMIT":
+                continue
+            remaining = _remaining(o)
+            if remaining <= 0:
+                continue
+            key = (o["action"], round(float(o["price"]), 2))
+            if key in desired and key not in matched:
+                matched.add(key)          # keep — same side & price
+            else:
+                to_cancel.append(o["order_id"])  # stale or duplicate
+
+        # Desired rungs with no existing match → need fresh placement
+        to_place = [
+            (action, price, desired[(action, price)])
+            for action, price in desired
+            if (action, price) not in matched
+        ]
+
+        # If the diff is large, bulk cancel + full repost is cheaper and
+        # safer than hitting the 20-ops/sec rate limit with individual
+        # DELETE + POST calls.
+        total_ops = len(to_cancel) + len(to_place)
+        if total_ops > 16:
+            cancel_my_ticker_orders(TICKER)
+            to_cancel = []
+            matched = set()
+            to_place = [
+                (action, price, desired[(action, price)])
+                for action, price in desired
+            ]
+
+        # Execute cancels
+        cancelled = 0
+        for oid in to_cancel:
+            try:
+                _request("DELETE", f"/orders/{oid}")
+                cancelled += 1
+            except Exception:
+                pass
+
+        # Execute placements
+        placed = 0
+        errors: List[str] = []
+        for action, price, qty in to_place:
+            try:
+                limit_order(action, qty, price)
+                placed += 1
+            except urllib.error.HTTPError as e:
+                errors.append(
+                    f"{action} {qty}@{price:.2f} {e.code} "
+                    f"{e.read().decode()[:60]}"
+                )
+
+        kept = len(matched)
+        return cancelled, placed, kept, errors
 
     # ── main tick ──────────────────────────────────────────────────────
     def step(self) -> None:
@@ -384,12 +507,16 @@ class MarketMaker:
             print(f"{prefix}  HOLD ({case['status']})")
             return
 
-        # ── cancel existing resting orders ────────────────────────────
-        if self.live:
-            try:
-                cancel_my_ticker_orders(TICKER)
-            except Exception as e:
-                print(f"{prefix}  cancel err: {type(e).__name__}: {e}")
+        # ── blackout: pull everything around news events ──────────────
+        if _in_blackout(tick):
+            if self.live:
+                try:
+                    cancel_my_ticker_orders(TICKER)
+                except Exception:
+                    pass
+            reason = "warmup" if tick <= MIN_TICK else "news"
+            print(f"{prefix}  BLACKOUT ({reason})")
+            return
 
         # ── taker: sweep crossable edge ───────────────────────────────
         own = trader_id()
@@ -419,49 +546,27 @@ class MarketMaker:
         else:
             action_tag = "no-cross"
 
-        # ── maker: place resting ladder (using post-trade position) ───
+        # ── maker: compute desired ladder, sync differentially ────────
         inv_ratio_post = max(-1.0, min(1.0, (post_x - TARGET) / MAX_INVENTORY))
         skew_post = -SKEW_FACTOR * inv_ratio_post
         center_post = self.ema_mid + skew_post
 
         bids, asks = self._compute_ladder(post_x, center_post, half_spread)
 
-        errors: List[str] = []
         if self.live:
-            for price, qty in bids:
-                try:
-                    limit_order("BUY", qty, price)
-                except urllib.error.HTTPError as e:
-                    errors.append(
-                        f"BID {qty}@{price:.2f} {e.code} "
-                        f"{e.read().decode()[:60]}"
-                    )
-            for price, qty in asks:
-                try:
-                    limit_order("SELL", qty, price)
-                except urllib.error.HTTPError as e:
-                    errors.append(
-                        f"ASK {qty}@{price:.2f} {e.code} "
-                        f"{e.read().decode()[:60]}"
-                    )
-
-            # Extreme fat-finger rungs (respect hard position limit only)
-            if post_x < MAX_POSITION:
-                try:
-                    limit_order("BUY", EXTREME_BID_QTY, EXTREME_BID_PRICE)
-                except urllib.error.HTTPError:
-                    pass
-            if post_x > -MAX_POSITION:
-                try:
-                    limit_order("SELL", EXTREME_ASK_QTY, EXTREME_ASK_PRICE)
-                except urllib.error.HTTPError:
-                    pass
+            cancelled, placed, kept, errors = self._sync_ladder(bids, asks)
+            sync_tag = f"sync:-{cancelled}/+{placed}/={kept}"
+        else:
+            cancelled, placed, kept, errors = 0, 0, 0, []
+            sync_tag = "[dry]"
 
         # ── log ───────────────────────────────────────────────────────
-        mode = "" if self.live else "[dry] "
         bid_str = " ".join(f"{p:.2f}x{q}" for p, q in bids) or "-"
         ask_str = " ".join(f"{p:.2f}x{q}" for p, q in asks) or "-"
-        print(f"{prefix}  {action_tag}  {mode}B[{bid_str}] A[{ask_str}]")
+        print(
+            f"{prefix}  {action_tag}  {sync_tag}  "
+            f"B[{bid_str}] A[{ask_str}]"
+        )
         for err in errors:
             print(f"     ! {err}")
 
