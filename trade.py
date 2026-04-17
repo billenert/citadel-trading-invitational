@@ -59,25 +59,25 @@ HARVEST_HEADLINE = re.compile(r"^H(\d+)\s*-\s*(\d+)\s*Beans$")
 
 # -- Ladder shape --
 N_RUNGS        = 5       # levels per side
-BASE_LOT       = 200     # lot size of the tightest rung
-LOT_INCREMENT  = 200     # additive increase per rung → 200, 400, 600, 800, 1000
+BASE_LOT       = 500     # lot size of the tightest rung
+LOT_INCREMENT  = 500     # additive increase per rung → 500, 1000, 1500, 2000, 2500
 
 # -- Spread & spacing --
 MIN_EDGE       = 0.01    # hard minimum half-spread (1 tick)
-BASE_SPREAD    = 0.02    # half-spread floor in calm markets ($)
-VOL_MULT       = 2.0     # half_spread += VOL_MULT * ema_vol
-STEP_FLOOR     = 0.02    # minimum gap between adjacent rungs ($)
+BASE_SPREAD    = 0.01    # half-spread floor in calm markets ($)
+VOL_MULT       = 1.5     # half_spread += VOL_MULT * ema_vol
+STEP_FLOOR     = 0.01    # minimum gap between adjacent rungs ($)
 STEP_FRAC      = 0.5     # rung step = half_spread * STEP_FRAC (before floor)
-VOL_STEP_SCALE = 0.00005 # extra step per bean in the rung's lot
+VOL_STEP_SCALE = 0.00003 # extra step per bean in the rung's lot
 
 # -- Inventory management --
-SKEW_FACTOR    = 0.10    # max center shift ($) at full inventory
-MAX_INVENTORY  = 2000    # deviation from target where one side fully suppresses
+SKEW_FACTOR    = 0.15    # max center shift ($) at full inventory
+MAX_INVENTORY  = 5000    # deviation from target where one side fully suppresses
 TARGET         = WINTER_TARGET
 MAX_POSITION   = 20000   # hard exchange limit (gross/net)
 
 # -- EMA --
-EMA_ALPHA      = 0.03    # ~23-tick half-life at 1 tick/sec
+EMA_ALPHA      = 0.05    # ~14-tick half-life at 1 tick/sec
 
 # -- Timing / blackout --
 MIN_TICK       = 10      # don't trade before this tick (let market stabilize)
